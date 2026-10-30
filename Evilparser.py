@@ -11,6 +11,7 @@ Features:
  - Always prints a High-Value Group Summary under the main Summary when BH files are supplied
  - Shows cracked high-value accounts (if any) and writes all findings into the log when requested
  - CSV/JSON export, Kerberoast correlation, auto-tagging
+ - Formatted plain-text report export
  - Backwards compatible with your previous workflow
 
 Usage:
@@ -21,6 +22,7 @@ Options:
   --log FILE                   Write plain-text log (ANSI colors stripped)
   --export-csv FILE            Export results to CSV
   --export-json FILE           Export results to JSON
+  --export-txt FILE            Export a tidy plain-text report
   --bloodhound-users FILE      BloodHound users.json (optional)
   --bloodhound-groups FILE     BloodHound groups.json (optional)
   --kerberoast FILE            Kerberoast cracked file (SPN:hash:plaintext)
@@ -38,6 +40,9 @@ import sys
 import re
 import json
 import csv
+import os
+import shutil
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, Dict, Set, List
@@ -256,7 +261,7 @@ def load_bloodhound_groups(path: str) -> Dict[str, Dict]:
 
 def normalize_domain_netbios(domain_str: str) -> str:
     """
-    Convert domain FQDN like 'eidsvoll.kommune.no' -> NetBIOS-like 'EIDSVOLL'
+    Convert domain FQDN like 'example.local' -> NetBIOS-like 'EXAMPLE'
     If already short, uppercase and return.
     """
     if not domain_str:
@@ -270,7 +275,7 @@ def normalize_domain_netbios(domain_str: str) -> str:
 
 def normalize_secretsdump_user_variants(user: str) -> Set[str]:
     """
-    Given a secretsdump user like 'eidsvoll.kommune.no\\sarasi-eid',
+    Given a secretsdump user like 'example.local\\alice',
     produce a set of normalized forms to aid matching to BloodHound:
       - original (as-is)
       - netbios domain version 'EIDSVOLL\\sarasi-eid'
@@ -386,6 +391,117 @@ def export_json(path: str, obj):
         json.dump(obj, f, indent=2)
 
 
+def export_text(path: str, lines: List[str]):
+    """Write the human-readable report, with ANSI codes and excess blank lines removed."""
+    cleaned = [strip_ansi(line).rstrip() for line in lines]
+    # Keep one blank line between sections, and avoid empty space at file edges.
+    tidy = []
+    for line in cleaned:
+        if line:
+            tidy.append(line)
+        elif tidy and tidy[-1] != '':
+            tidy.append('')
+    while tidy and not tidy[-1]:
+        tidy.pop()
+
+    p = Path(path)
+    with p.open('w', encoding='utf-8') as f:
+        f.write('\n'.join(tidy) + '\n')
+
+
+def normalize_account_id(account: str) -> str:
+    """Normalize account identifiers for statistics without changing display values."""
+    return unicodedata.normalize('NFKC', str(account)).strip().casefold()
+
+
+def aggregate_password_stats(accounts: Dict[str, str], processed_accounts=None) -> Dict:
+    """Aggregate distinct account/password pairs; accounts maps IDs to cracked plaintexts."""
+    distinct = {}
+    for account, password in accounts.items():
+        key = normalize_account_id(account)
+        if key:
+            # Later values are authoritative when normalized identifiers collide.
+            distinct[key] = (str(account), password if password else None)
+    if processed_accounts is not None:
+        eligible = {normalize_account_id(a) for a in processed_accounts if normalize_account_id(a)}
+        distinct = {k: v for k, v in distinct.items() if k in eligible}
+        total = len(eligible)
+    else:
+        total = len(distinct)
+    cracked = {key: row[1] for key, row in distinct.items() if row[1] is not None}
+    password_accounts = defaultdict(set)
+    for key, password in cracked.items():
+        password_accounts[password].add(key)
+    cracked_count = len(cracked)
+    reused_accounts = set().union(*(users for users in password_accounts.values() if len(users) > 1)) if any(
+        len(users) > 1 for users in password_accounts.values()) else set()
+    return {
+        'total': total,
+        'cracked': cracked_count,
+        'not_cracked': max(total - cracked_count, 0),
+        'cracking_pct': cracked_count / total * 100 if total else 0.0,
+        'unique_passwords': len(password_accounts),
+        'reused_accounts': len(reused_accounts),
+        'reuse_pct': len(reused_accounts) / cracked_count * 100 if cracked_count else 0.0,
+        'password_accounts': password_accounts,
+    }
+
+
+def rank_reused_passwords(stats: Dict, limit: int = 10) -> List[Tuple[str, int]]:
+    """Return reused plaintexts ordered by distinct account count then password value."""
+    ranked = [(password, len(users)) for password, users in stats['password_accounts'].items() if len(users) > 1]
+    return sorted(ranked, key=lambda row: (-row[1], row[0]))[:limit]
+
+
+def render_password_audit_summary(stats: Dict, width: int = None) -> List[str]:
+    """Build a compact terminal summary, including reused plaintext passwords."""
+    width = max(72, min(width or shutil.get_terminal_size((100, 24)).columns, 120))
+    border = '=' * width
+    separator = '-' * width
+    lines = [border, 'PASSWORD AUDIT SUMMARY'.center(width), border, '']
+    labels = [
+        ('Total accounts processed', stats['total'], None),
+        ('Successfully cracked', stats['cracked'], None),
+        ('Not cracked', stats['not_cracked'], None),
+        ('Total percentage cracked', None, stats['cracking_pct']),
+        ('Unique cracked passwords', stats['unique_passwords'], None),
+        ('Accounts with reused passwords', stats['reused_accounts'], None),
+        ('Password reuse among cracked', None, stats['reuse_pct']),
+    ]
+    label_width = max(len(label) for label, _, _ in labels)
+    for label, number, percentage in labels:
+        value = f'{percentage:.2f}%' if percentage is not None else f'{number:,}'
+        lines.append(f'  {label:<{label_width}} : {value:>12}')
+    lines += ['', separator, 'TOP 20 REUSED PASSWORDS'.center(width), separator]
+    pw_width = min(32, width - 42)
+    lines.append(f"  {'#':>2}  {'PASSWORD':<{pw_width}}  {'ACCOUNTS':>9}  {'% CRACKED':>10}")
+    lines.append(separator)
+    ranked = rank_reused_passwords(stats, limit=20)
+    if not ranked:
+        lines.append('  No reused cracked passwords.'.center(width))
+    for index, (password, count) in enumerate(ranked, 1):
+        shown = password
+        # Escape terminal controls and keep Unicode intact; truncate by code points.
+        shown = ''.join(ch if ch.isprintable() else '?' for ch in shown)
+        if len(shown) > pw_width:
+            shown = shown[:max(0, pw_width - 1)] + '…'
+        pct = count / stats['cracked'] * 100 if stats['cracked'] else 0.0
+        lines.append(f'  {index:>2}  {shown:<{pw_width}}  {count:>9,}  {pct:>9.2f}%')
+    lines += [separator, '', '  SUMMARY', f"  {stats['cracking_pct']:.2f}% of eligible accounts were cracked.",
+              f"  {stats['reuse_pct']:.2f}% of cracked accounts share their password with another account.", border]
+    return lines
+
+
+def print_password_audit_summary(stats: Dict):
+    """Print the summary with color only on interactive terminals and when allowed."""
+    color_enabled = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
+    for line in render_password_audit_summary(stats):
+        if color_enabled:
+            print(Fore.CYAN + line)
+        else:
+            print(line)
+
+
 # High-value groups config
 HIGH_VALUE_GROUP_KEYWORDS = {
     'domain-admins': ['domain admins', 'domain-admins', 'domain_admins'],
@@ -486,6 +602,7 @@ def main():
     ap.add_argument('--log', '-l', help='Write a plain-text log to this file (colors removed)')
     ap.add_argument('--export-csv', help='Export results (reused groups) to CSV')
     ap.add_argument('--export-json', help='Export results to JSON')
+    ap.add_argument('--export-txt', help='Export a tidy plain-text report')
     ap.add_argument('--bloodhound-users', help='BloodHound users JSON file (optional)')
     ap.add_argument('--bloodhound-groups', help='BloodHound groups JSON file (optional)')
     ap.add_argument('--kerberoast', help='Optional Kerberoast cracked file (SPN:hash:plaintext)')
@@ -616,6 +733,9 @@ def main():
     denominator = len(denominator_users)
     numerator = sum(1 for u in denominator_users if u in user_plain)
     pct = (numerator / denominator * 100) if denominator else 0.0
+    audit_stats = aggregate_password_stats(
+        {u: user_plain.get(u) for u in sd}, processed_accounts=denominator_users
+    )
 
     print(Style.BRIGHT + "\nSummary:")
     s_total = f"  Secretsdump users (all): {total_secretsdump_users}"
@@ -747,6 +867,12 @@ def main():
             print(Fore.YELLOW + f"Exported JSON to: {args.export_json}")
         except Exception as e:
             print(Fore.RED + f"Failed to export JSON: {e}")
+    if args.export_txt:
+        try:
+            export_text(args.export_txt, lines_for_log)
+            print(Fore.YELLOW + f"\nExported text report to: {args.export_txt}")
+        except Exception as e:
+            print(Fore.RED + f"Failed to export text report: {e}")
 
     # Auto-tagging (extended)
     if args.auto_tag:
@@ -797,6 +923,7 @@ def main():
             print(Fore.RED + f"Failed to write log: {e}")
 
     print(Style.DIM + "\nDone.")
+    print_password_audit_summary(audit_stats)
 
 
 if __name__ == '__main__':
